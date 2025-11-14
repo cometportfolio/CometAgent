@@ -1,0 +1,6 @@
+symbol,close,rsi14,sma50,sma200,macd,macd_signal,atr14,ta_score,news_x_score,x_only_score,total_score,decision,target_pct_delta,ta_reason,nx_detail
+BTC-USD,96184.7578125,0.0,,,-1475.9753725008923,-533.0699885144795,2970.7887840922403,-0.225,0.0,0.0,-0.09,Hold,0.0,Below SMA50; Momentum negative (MACD<signal); RSI14=0.0,NewsSent=+0.00 from 0 headlines; XSent=+0.00 from 0 posts.
+ETH-USD,3184.507080078125,0.0,,,-63.82118215437822,-23.76845680779482,175.3584984553352,-0.225,0.0,0.0,-0.09,Hold,0.0,Below SMA50; Momentum negative (MACD<signal); RSI14=0.0,NewsSent=+0.00 from 0 headlines; XSent=+0.00 from 0 posts.
+SOL-USD,141.0821990966797,0.0,,,-4.565907566242146,-1.7812628137805364,7.961251491608594,-0.225,0.0,0.0,-0.09,Hold,0.0,Below SMA50; Momentum negative (MACD<signal); RSI14=0.0,NewsSent=+0.00 from 0 headlines; XSent=+0.00 from 0 posts.
+ADA-USD,0.5118130445480347,0.0,,,-0.013762721937123579,-0.005356270082956745,0.02943910138587662,-0.225,0.0,0.0,-0.09,Hold,0.0,Below SMA50; Momentum negative (MACD<signal); RSI14=0.0,NewsSent=+0.00 from 0 headlines; XSent=+0.00 from 0 posts.
+XRP-USD,2.288886547088623,0.0,,,-0.04210535542299043,-0.01687743113662966,0.20556245436399298,-0.225,0.0,0.0,-0.09,Hold,0.0,Below SMA50; Momentum negative (MACD<signal); RSI14=0.0,NewsSent=+0.00 from 0 headlines; XSent=+0.00 from 0 posts.

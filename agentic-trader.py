@@ -482,8 +482,8 @@ def _yf_period_for_horizon(horizon: str) -> str:
 def _download_with_timeout(symbol: str, period: str, timeout: int = 10) -> pd.DataFrame:
     """Download data with timeout - simplified to avoid hanging"""
     try:
-        # Use a very restrictive period to minimize data and speed up download
-        df = yf.download(symbol, period="5d", interval="1d", auto_adjust=True, progress=False, timeout=timeout)
+        # Use the specified period to get proper data for indicators
+        df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, timeout=timeout)
         if df is not None and not df.empty:
             return df
         else:
@@ -648,8 +648,13 @@ def _sentiment_vader(texts: List[str], weights: Optional[List[float]] = None) ->
     return float(np.clip(weighted_avg, -1.0, 1.0))
 
 def _fetch_news_with_timeout(symbol: str, timeout: int = 10) -> List[dict]:
-    """Fetch news with timeout - disabled for now to prevent hanging"""
-    return []  # Return empty list to prevent hanging
+    """Fetch news with timeout"""
+    try:
+        ticker = yf.Ticker(symbol)
+        news = ticker.news if hasattr(ticker, 'news') else []
+        return news if news else []
+    except Exception:
+        return []
 
 def _news_titles_for_symbol(symbol: str, portfolio_type: str, limit: int = 20) -> Tuple[List[str], List[float]]:
     titles = []
@@ -738,7 +743,45 @@ def _x_posts_for_symbol(symbol: str, weighted_handles: List[Dict[str, float]], l
     Fetch X posts for symbol from weighted handles.
     Returns (posts, weights) where weights correspond to each post's source weight.
     """
-    return [], []  # Return empty lists to prevent hanging - implementation disabled for now
+    if not _SNSCRAPE:
+        return [], []  # snscrape not available
+
+    posts = []
+    weights = []
+
+    # Extract base symbol (e.g., BTC from BTC-USD)
+    base_symbol = symbol.split('-')[0] if '-' in symbol else symbol
+
+    for handle_info in weighted_handles[:5]:  # Limit to top 5 weighted handles
+        handle = handle_info["handle"]
+        weight = handle_info["weight"]
+
+        try:
+            # Use snscrape with timeout to search for symbol mentions from handle
+            cmd = f'snscrape --max-results {limit_per_handle} --jsonl twitter-search "from:{handle} {base_symbol}"'
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5  # 5 second timeout per handle
+            )
+
+            if result.returncode == 0 and result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        try:
+                            tweet = json.loads(line)
+                            content = tweet.get('content', '') or tweet.get('renderedContent', '')
+                            if content:
+                                posts.append(content)
+                                weights.append(weight)
+                        except json.JSONDecodeError:
+                            continue
+        except (subprocess.TimeoutExpired, Exception):
+            continue  # Skip handles that timeout or error
+
+    return posts, weights
 
 def _score_news_and_x(symbol: str, portfolio_type: str, horizon: str) -> Tuple[float,float,str]:
     # News titles sentiment with source weighting
