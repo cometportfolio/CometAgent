@@ -37,12 +37,15 @@ Outputs
 
 Dependencies (install as needed)
 --------------------------------
-pip install pandas numpy yfinance feedparser vaderSentiment snscrape
+pip install pandas numpy yfinance feedparser vaderSentiment snscrape praw
 
 Notes
 -----
-- News sentiment pulls from Yahoo Finance via yfinance.get_news() when available,
-  and can optionally blend in RSS (feedparser) and X posts (snscrape) if installed.
+- Multi-source sentiment analysis:
+  * News: Yahoo Finance (via yfinance) + optional RSS feeds (feedparser)
+  * Social: X/Twitter posts (via snscrape)
+  * Reddit: Posts and comments with engagement weighting (via praw)
+- Reddit analysis includes upvote, award, and comment count weighting for signal quality
 - For crypto tickers, symbols like 'BTC'/'ETH' are mapped to 'BTC-USD'/'ETH-USD' for prices.
 - Optimized for Perplexity Comet browser's autonomous execution capabilities.
 - This is NOT financial advice; it's a research tool to aid your process.
@@ -57,7 +60,7 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-__version__ = "1.0.0"
+__version__ = "3.23"
 
 # Soft deps; handled at runtime if missing
 try:
@@ -82,6 +85,14 @@ try:
     _SNSCRAPE = shutil.which("snscrape") is not None
 except Exception:
     _SNSCRAPE = False
+
+# PRAW for Reddit (optional). Do not hard-fail if missing.
+try:
+    import praw
+    _PRAW_AVAILABLE = True
+except Exception:
+    _PRAW_AVAILABLE = False
+    praw = None
 
 
 # ----------------------------- Config -------------------------------- #
@@ -197,6 +208,64 @@ def _get_weighted_social_sources(portfolio_type: str) -> List[Dict[str, float]]:
     weighted_sources.sort(key=lambda x: x["weight"], reverse=True)
     return weighted_sources
 
+def _load_reddit_source_weights() -> Dict[str, float]:
+    """Load Reddit subreddit weights from reddit_sources_weighting.md if it exists."""
+    config_path = "reddit_sources_weighting.md"
+    if not os.path.exists(config_path):
+        return {}
+
+    weights = {}
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#') or line.startswith('subreddit'):
+                    continue
+
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) != 2:
+                    continue
+
+                subreddit_name, weight_str = parts
+                try:
+                    weight = float(weight_str)
+                    if 1 <= weight <= 10:
+                        # Clean subreddit name (remove r/ prefix if present)
+                        if subreddit_name.startswith('r/'):
+                            subreddit_name = subreddit_name[2:]
+                        weights[subreddit_name] = weight
+                except ValueError:
+                    continue
+    except Exception:
+        return {}
+
+    return weights
+
+def _get_weighted_reddit_sources(portfolio_type: str) -> List[Dict[str, float]]:
+    """Get Reddit subreddits with their weights applied."""
+    default_subreddits = DEFAULT_STOCK_SUBREDDITS if portfolio_type == "stocks" else DEFAULT_CRYPTO_SUBREDDITS
+    weights = _load_reddit_source_weights()
+
+    if not weights:
+        # Return default subreddits with default weight of 5
+        return [{"subreddit": sub, "weight": 5.0} for sub in default_subreddits]
+
+    # Start with configured weighted sources
+    weighted_sources = []
+
+    # Add all sources from config file (they may include sources not in defaults)
+    for subreddit, weight in weights.items():
+        weighted_sources.append({"subreddit": subreddit, "weight": weight})
+
+    # Add any default subreddits not in config with default weight
+    for subreddit in default_subreddits:
+        if subreddit not in weights:
+            weighted_sources.append({"subreddit": subreddit, "weight": 5.0})
+
+    # Sort by weight (descending) to prioritize higher-weighted sources
+    weighted_sources.sort(key=lambda x: x["weight"], reverse=True)
+    return weighted_sources
+
 DEFAULT_STOCK_SOURCES = [
     # High-impact publications (not exhaustive). These serve both as human references
     # and for optional RSS lookups if you add/point to RSS feeds you prefer.
@@ -241,6 +310,31 @@ DEFAULT_CRYPTO_X_HANDLES = [
     "CoinDesk", "Cointelegraph", "TheBlock__", "decryptmedia",
     "KaikoData", "glassnode", "cryptoquant_com", "santimentfeed",
     "DefiLlama", "MessariCrypto"
+]
+
+# Reddit subreddits to scan for trading sentiment
+DEFAULT_STOCK_SUBREDDITS = [
+    "wallstreetbets",     # High volume, retail sentiment
+    "stocks",             # General stock discussion
+    "investing",          # Long-term investment focus
+    "StockMarket",        # Market-wide discussions
+    "options",            # Options trading
+    "Daytrading",         # Short-term trading
+    "SecurityAnalysis",   # Fundamental analysis
+    "ValueInvesting",     # Value-focused
+    "Dividends",          # Dividend stocks
+]
+
+DEFAULT_CRYPTO_SUBREDDITS = [
+    "CryptoCurrency",     # General crypto discussion
+    "Bitcoin",            # Bitcoin-specific
+    "ethereum",           # Ethereum-specific
+    "CryptoMarkets",      # Trading focused
+    "altcoin",            # Altcoin discussion
+    "binance",            # Exchange discussion
+    "defi",               # DeFi projects
+    "NFT",                # NFT discussion
+    "BitcoinMarkets",     # Bitcoin trading
 ]
 
 
@@ -785,7 +879,146 @@ def _x_posts_for_symbol(symbol: str, weighted_handles: List[Dict[str, float]], l
 
     return posts, weights
 
-def _score_news_and_x(symbol: str, portfolio_type: str, horizon: str) -> Tuple[float,float,str]:
+def _get_reddit_client():
+    """
+    Get Reddit client using PRAW.
+    Uses read-only mode (no authentication required).
+    """
+    if not _PRAW_AVAILABLE:
+        return None
+
+    try:
+        # Use read-only mode which doesn't require authentication
+        reddit = praw.Reddit(
+            client_id="reddit_scraper",
+            client_secret=None,
+            user_agent="trading_signal_analyzer/1.0"
+        )
+        # Set to read-only mode
+        reddit.read_only = True
+        return reddit
+    except Exception:
+        return None
+
+def _reddit_posts_for_symbol(symbol: str, weighted_subreddits: List[Dict[str, float]],
+                             limit_per_subreddit: int = 25,
+                             time_filter: str = "week") -> Tuple[List[str], List[float], Dict]:
+    """
+    Fetch Reddit posts and top comments for a symbol from weighted subreddits.
+    Returns (texts, weights, metadata) where:
+    - texts: list of post titles + selftext + top comments
+    - weights: engagement-adjusted weights for each text
+    - metadata: dict with stats about the fetch
+
+    Engagement weighting formula:
+    base_weight * (1 + log(1 + upvotes)/10) * (1 + awards/5) * (1 + comment_count/50)
+    """
+    if not _PRAW_AVAILABLE:
+        return [], [], {"error": "PRAW not available"}
+
+    reddit = _get_reddit_client()
+    if reddit is None:
+        return [], [], {"error": "Could not initialize Reddit client"}
+
+    texts = []
+    weights = []
+
+    # Extract base symbol (e.g., BTC from BTC-USD, AAPL from AAPL)
+    base_symbol = symbol.split('-')[0] if '-' in symbol else symbol
+
+    # Metadata tracking
+    total_posts = 0
+    total_comments = 0
+    subreddits_checked = 0
+
+    for sub_info in weighted_subreddits[:7]:  # Limit to top 7 weighted subreddits
+        subreddit_name = sub_info["subreddit"]
+        base_weight = sub_info["weight"]
+
+        try:
+            subreddit = reddit.subreddit(subreddit_name)
+
+            # Search for symbol mentions in the subreddit
+            # Use multiple search strategies for better coverage
+            search_queries = [
+                f"{base_symbol}",
+                f"${base_symbol}",
+            ]
+
+            posts_found = set()  # Track unique posts by ID
+
+            for query in search_queries:
+                try:
+                    # Search recent posts mentioning the symbol
+                    for post in subreddit.search(query, time_filter=time_filter, limit=limit_per_subreddit):
+                        if post.id in posts_found:
+                            continue  # Skip duplicates
+                        posts_found.add(post.id)
+
+                        # Calculate engagement multiplier
+                        upvotes = max(0, post.score)
+                        awards = post.total_awards_received if hasattr(post, 'total_awards_received') else 0
+                        num_comments = post.num_comments
+
+                        # Engagement formula: logarithmic scaling to prevent extreme outliers
+                        engagement_multiplier = (
+                            (1 + np.log1p(upvotes) / 10) *     # Upvote boost (log scale)
+                            (1 + awards / 5) *                  # Award boost
+                            (1 + num_comments / 50)             # Comment activity boost
+                        )
+
+                        # Final weight combines subreddit credibility with engagement
+                        post_weight = base_weight * engagement_multiplier
+
+                        # Extract post title and body
+                        post_text = post.title
+                        if post.selftext and len(post.selftext) > 0:
+                            post_text += " " + post.selftext[:500]  # Limit body length
+
+                        texts.append(post_text)
+                        weights.append(post_weight)
+                        total_posts += 1
+
+                        # Also fetch top comments for deeper sentiment analysis
+                        try:
+                            post.comment_sort = 'top'
+                            post.comment_limit = 5  # Top 5 comments
+                            post.comments.replace_more(limit=0)  # Don't expand "more comments"
+
+                            for comment in post.comments[:5]:
+                                if hasattr(comment, 'body') and len(comment.body) > 20:
+                                    comment_upvotes = max(0, comment.score)
+                                    # Comments get lower base weight but still benefit from engagement
+                                    comment_multiplier = (1 + np.log1p(comment_upvotes) / 15)
+                                    comment_weight = (base_weight * 0.6) * comment_multiplier
+
+                                    texts.append(comment.body[:300])  # Limit comment length
+                                    weights.append(comment_weight)
+                                    total_comments += 1
+                        except Exception:
+                            pass  # Skip comments if there's an issue
+
+                        # Rate limiting: small delay between posts
+                        time.sleep(0.1)
+
+                except Exception:
+                    continue  # Skip this search query if it fails
+
+            subreddits_checked += 1
+
+        except Exception:
+            continue  # Skip this subreddit if there's an issue
+
+    metadata = {
+        "total_posts": total_posts,
+        "total_comments": total_comments,
+        "subreddits_checked": subreddits_checked,
+        "total_texts": len(texts)
+    }
+
+    return texts, weights, metadata
+
+def _score_news_x_and_reddit(symbol: str, portfolio_type: str, horizon: str) -> Tuple[float,float,float,str]:
     # News titles sentiment with source weighting
     news_titles, news_weights = _news_titles_for_symbol(symbol, portfolio_type, limit=30)
     news_score = _sentiment_vader(news_titles, news_weights)
@@ -795,27 +1028,62 @@ def _score_news_and_x(symbol: str, portfolio_type: str, horizon: str) -> Tuple[f
     x_posts, x_weights = _x_posts_for_symbol(symbol, weighted_handles, limit_per_handle=5)
     x_score = _sentiment_vader(x_posts, x_weights)
 
-    # Weighting by horizon (long gives more weight to news; short balances)
-    if horizon == "short":
-        wn, wx = 0.65, 0.35
-    elif horizon == "medium":
-        wn, wx = 0.7, 0.3
-    else:
-        wn, wx = 0.8, 0.2
+    # Reddit posts and comments sentiment with engagement weighting
+    weighted_subreddits = _get_weighted_reddit_sources(portfolio_type)
 
-    blended = wn*news_score + wx*x_score
-    detail = f"NewsSent={news_score:+.2f} from {len(news_titles)} headlines; XSent={x_score:+.2f} from {len(x_posts)} posts."
-    return float(blended), float(x_score), detail
-
-def _combine_scores(ta: float, news_blended: float, x: float, horizon: str) -> float:
-    # Blend: short -> TA heavier; long -> news heavier
+    # Adjust time filter based on horizon
     if horizon == "short":
-        w_ta, w_news, w_x = 0.60, 0.25, 0.15
+        time_filter = "day"
+        limit_per_sub = 30
     elif horizon == "medium":
-        w_ta, w_news, w_x = 0.50, 0.35, 0.15
-    else:
-        w_ta, w_news, w_x = 0.40, 0.45, 0.15
-    return float(np.clip(w_ta*ta + w_news*news_blended + w_x*x, -1.0, 1.0))
+        time_filter = "week"
+        limit_per_sub = 25
+    else:  # long
+        time_filter = "month"
+        limit_per_sub = 20
+
+    reddit_texts, reddit_weights, reddit_metadata = _reddit_posts_for_symbol(
+        symbol, weighted_subreddits, limit_per_subreddit=limit_per_sub, time_filter=time_filter
+    )
+    reddit_score = _sentiment_vader(reddit_texts, reddit_weights)
+
+    # Weighting by horizon
+    # Short: news + X + Reddit balanced for quick signals
+    # Medium: balanced across all sources
+    # Long: news heavier, Reddit and X for sentiment validation
+    if horizon == "short":
+        wn, wx, wr = 0.50, 0.25, 0.25
+    elif horizon == "medium":
+        wn, wx, wr = 0.55, 0.25, 0.20
+    else:  # long
+        wn, wx, wr = 0.60, 0.20, 0.20
+
+    blended = wn*news_score + wx*x_score + wr*reddit_score
+
+    # Build detailed report
+    detail_parts = [
+        f"NewsSent={news_score:+.2f} ({len(news_titles)} headlines)",
+        f"XSent={x_score:+.2f} ({len(x_posts)} posts)",
+        f"RedditSent={reddit_score:+.2f} ({reddit_metadata.get('total_posts', 0)} posts, {reddit_metadata.get('total_comments', 0)} comments)"
+    ]
+    detail = "; ".join(detail_parts)
+
+    return float(blended), float(x_score), float(reddit_score), detail
+
+def _combine_scores(ta: float, news_blended: float, x: float, reddit: float, horizon: str) -> float:
+    # Blend: short -> TA heavier; long -> sentiment heavier
+    # News/X/Reddit are already blended in news_blended, but we keep separate scores for reporting
+    if horizon == "short":
+        w_ta, w_sentiment = 0.60, 0.40
+    elif horizon == "medium":
+        w_ta, w_sentiment = 0.50, 0.50
+    else:  # long
+        w_ta, w_sentiment = 0.40, 0.60
+
+    # news_blended already contains weighted combination of news, X, and Reddit
+    total = w_ta * ta + w_sentiment * news_blended
+
+    return float(np.clip(total, -1.0, 1.0))
 
 def _decide(total_score: float, ind: Indicators) -> Decision:
     # Map score to discrete action and target allocation delta (suggested)
@@ -977,8 +1245,8 @@ def analyze_positions(portfolio_type: str, horizon: str, platform: str, position
             df = _download_history(pos.symbol, horizon)
             ind = _indicators(df)
             ta_score, ta_detail = _score_ta(ind, horizon)
-            news_blended, x_only, nx_detail = _score_news_and_x(pos.symbol, portfolio_type, horizon)
-            total = _combine_scores(ta_score, news_blended, x_only, horizon)
+            news_blended, x_only, reddit_only, sentiment_detail = _score_news_x_and_reddit(pos.symbol, portfolio_type, horizon)
+            total = _combine_scores(ta_score, news_blended, x_only, reddit_only, horizon)
             decision = _decide(total, ind)
             rows.append({
                 "symbol": pos.symbol,
@@ -990,13 +1258,14 @@ def analyze_positions(portfolio_type: str, horizon: str, platform: str, position
                 "macd_signal": ind.macd_signal,
                 "atr14": ind.atr14,
                 "ta_score": round(ta_score,3),
-                "news_x_score": round(news_blended,3),
+                "sentiment_score": round(news_blended,3),
                 "x_only_score": round(x_only,3),
+                "reddit_only_score": round(reddit_only,3),
                 "total_score": round(total,3),
                 "decision": decision.action,
                 "target_pct_delta": decision.target_pct_delta,
                 "ta_reason": ta_detail,
-                "nx_detail": nx_detail
+                "sentiment_detail": sentiment_detail
             })
         except Exception as e:
             rows.append({
