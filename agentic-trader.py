@@ -57,6 +57,8 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+__version__ = "1.0.0"
+
 # Soft deps; handled at runtime if missing
 try:
     import yfinance as yf
@@ -1033,6 +1035,7 @@ def _write_outputs(df: pd.DataFrame, prompts: List[Dict[str,str]]) -> Tuple[str,
 
 def main():
     parser = argparse.ArgumentParser(description="Comet Trading Agent (signals + Comet browser prompts)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--portfolio-type", required=True, choices=["stocks","crypto"])
     parser.add_argument("--horizon", required=True, choices=["short","medium","long"])
     parser.add_argument("--platform", required=True, help="e.g., Coinbase, Fidelity, Schwab, E*TRADE, Robinhood, IBKR")
@@ -1046,6 +1049,7 @@ def main():
 
     # Console summary
     print("\n=== COMET TRADING REPORT ===")
+    print(f"Version: {__version__}")
     print(f"Portfolio type: {args.portfolio_type} | Horizon: {args.horizon} | Platform: {args.platform}")
 
     # Select columns that exist in the DataFrame
