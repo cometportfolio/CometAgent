@@ -23,6 +23,15 @@ from typing import List, Dict, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
+# Try to import confidence scorer
+try:
+    from confidence_scorer import ConfidenceScorer
+    _CONFIDENCE_AVAILABLE = True
+except ImportError:
+    _CONFIDENCE_AVAILABLE = False
+    ConfidenceScorer = None
+    print("Warning: confidence_scorer.py not found. Confidence scoring disabled in backtesting.")
+
 # Handle potential version compatibility issues
 try:
     import numpy as np
@@ -282,6 +291,37 @@ class Backtester:
             # Make decision
             decision = _simple_decide(total_score)
 
+            # Calculate confidence score if available
+            confidence_score = np.nan
+            if _CONFIDENCE_AVAILABLE and ConfidenceScorer:
+                try:
+                    scorer = ConfidenceScorer()
+                    # Add required indicators for confidence calculation
+                    full_indicators = indicators.copy()
+                    # Add missing bollinger band data (simplified calculation)
+                    close_series = data_up_to_date['Close']
+                    bb_mid = close_series.rolling(20).mean().iloc[-1]
+                    bb_std = close_series.rolling(20).std().iloc[-1]
+                    full_indicators['bb_mid'] = bb_mid if not np.isnan(bb_mid) else indicators['close']
+                    full_indicators['bb_up'] = bb_mid + 2*bb_std if not np.isnan(bb_std) else indicators['close'] * 1.02
+                    full_indicators['bb_dn'] = bb_mid - 2*bb_std if not np.isnan(bb_std) else indicators['close'] * 0.98
+                    full_indicators['atr14'] = indicators.get('atr14', 1.0)  # Default ATR if missing
+
+                    # Simplified sentiment (no historical sentiment data available)
+                    sentiment_dict = {
+                        'sentiment_score': 0.0,
+                        'x_only_score': 0.0,
+                        'reddit_only_score': 0.0
+                    }
+
+                    confidence_breakdown = scorer.calculate_confidence(
+                        full_indicators, sentiment_dict, decision['action'], self.symbol, self.horizon
+                    )
+                    confidence_score = confidence_breakdown.overall
+                except Exception as e:
+                    # Confidence calculation failed, continue without it
+                    confidence_score = np.nan
+
             return {
                 'date': signal_date,
                 'action': decision['action'],
@@ -292,7 +332,8 @@ class Backtester:
                 'close_price': indicators['close'],
                 'rsi': indicators['rsi14'],
                 'macd': indicators['macd'],
-                'reasoning': decision['rationale']
+                'reasoning': decision['rationale'],
+                'confidence': confidence_score
             }
 
         except Exception as e:
@@ -380,6 +421,7 @@ class Backtester:
                 'total_score': signal['total_score'],
                 'ta_score': signal['ta_score'],
                 'sentiment_score': signal['sentiment_score'],
+                'confidence': signal.get('confidence', np.nan),
                 'portfolio_value': portfolio_value,
                 'cash': portfolio.cash,
                 'shares': portfolio.shares,
@@ -467,6 +509,65 @@ class Backtester:
         # Volatility
         volatility = portfolio_returns.std() * np.sqrt(252) if len(portfolio_returns) > 1 else 0
 
+        # Confidence analysis
+        confidence_metrics = {}
+        if 'confidence' in df_results.columns and _CONFIDENCE_AVAILABLE:
+            confidence_scores = df_results['confidence'].dropna()
+            if len(confidence_scores) > 0:
+                # Overall confidence statistics
+                confidence_metrics['avg_confidence'] = confidence_scores.mean()
+                confidence_metrics['median_confidence'] = confidence_scores.median()
+                confidence_metrics['min_confidence'] = confidence_scores.min()
+                confidence_metrics['max_confidence'] = confidence_scores.max()
+
+                # Confidence vs performance analysis
+                trades_with_conf = df_results[
+                    (df_results['trade_executed']) &
+                    (~df_results['confidence'].isna())
+                ].copy()
+
+                if len(trades_with_conf) > 0:
+                    # Calculate win rates by confidence level
+                    high_conf_trades = trades_with_conf[trades_with_conf['confidence'] >= 70]
+                    med_conf_trades = trades_with_conf[
+                        (trades_with_conf['confidence'] >= 40) &
+                        (trades_with_conf['confidence'] < 70)
+                    ]
+                    low_conf_trades = trades_with_conf[trades_with_conf['confidence'] < 40]
+
+                    # Calculate win rates for each confidence level
+                    def calc_win_rate_for_trades(trades_df):
+                        if len(trades_df) == 0:
+                            return 0, 0
+
+                        wins = 0
+                        for idx, row in trades_df.iterrows():
+                            future_rows = df_results[df_results.index > idx]
+                            if not future_rows.empty:
+                                next_price = future_rows['price'].iloc[0]
+                                current_price = row['price']
+
+                                if row['signal_action'] in ['Buy', 'Strong Buy']:
+                                    trade_return = (next_price / current_price) - 1
+                                else:
+                                    trade_return = (current_price / next_price) - 1
+
+                                if trade_return > 0:
+                                    wins += 1
+
+                        return wins, len(trades_df)
+
+                    high_wins, high_total = calc_win_rate_for_trades(high_conf_trades)
+                    med_wins, med_total = calc_win_rate_for_trades(med_conf_trades)
+                    low_wins, low_total = calc_win_rate_for_trades(low_conf_trades)
+
+                    confidence_metrics['high_conf_win_rate'] = (high_wins / high_total * 100) if high_total > 0 else 0
+                    confidence_metrics['med_conf_win_rate'] = (med_wins / med_total * 100) if med_total > 0 else 0
+                    confidence_metrics['low_conf_win_rate'] = (low_wins / low_total * 100) if low_total > 0 else 0
+                    confidence_metrics['high_conf_trades'] = high_total
+                    confidence_metrics['med_conf_trades'] = med_total
+                    confidence_metrics['low_conf_trades'] = low_total
+
         metrics = {
             'total_return': total_return * 100,
             'buy_hold_return': bh_return * 100,
@@ -479,7 +580,8 @@ class Backtester:
             'avg_loss': avg_loss * 100,
             'max_drawdown': max_drawdown * 100,
             'sharpe_ratio': sharpe_ratio,
-            'volatility': volatility * 100
+            'volatility': volatility * 100,
+            **confidence_metrics  # Add confidence metrics
         }
 
         self.performance_metrics = metrics
@@ -655,6 +757,22 @@ def main():
         print(f"{'Max Drawdown:':<25} {metrics.get('max_drawdown', 0):.2f}%")
         print(f"{'Sharpe Ratio:':<25} {metrics.get('sharpe_ratio', 0):.2f}")
         print(f"{'Volatility:':<25} {metrics.get('volatility', 0):.2f}%")
+
+        # Confidence Analysis (if available)
+        if any(key.startswith('avg_confidence') for key in metrics.keys()):
+            print(f"\n{'Confidence Analysis:':<25}")
+            print(f"{'Average Confidence:':<25} {metrics.get('avg_confidence', 0):.1f}")
+            print(f"{'Median Confidence:':<25} {metrics.get('median_confidence', 0):.1f}")
+            print(f"{'Confidence Range:':<25} {metrics.get('min_confidence', 0):.1f} - {metrics.get('max_confidence', 0):.1f}")
+
+            # Win rate by confidence level
+            if metrics.get('high_conf_trades', 0) > 0:
+                print(f"\n{'Confidence vs Performance:':<25}")
+                print(f"{'High Confidence (≥70):':<25} {metrics.get('high_conf_win_rate', 0):.1f}% win rate ({metrics.get('high_conf_trades', 0)} trades)")
+            if metrics.get('med_conf_trades', 0) > 0:
+                print(f"{'Medium Confidence (40-69):':<25} {metrics.get('med_conf_win_rate', 0):.1f}% win rate ({metrics.get('med_conf_trades', 0)} trades)")
+            if metrics.get('low_conf_trades', 0) > 0:
+                print(f"{'Low Confidence (<40):':<25} {metrics.get('low_conf_win_rate', 0):.1f}% win rate ({metrics.get('low_conf_trades', 0)} trades)")
 
         # Generate visualization
         print(f"\nGenerating performance chart...")

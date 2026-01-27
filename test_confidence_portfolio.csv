@@ -1,0 +1,3 @@
+ticker,quantity,purchase_price,purchase_date
+AAPL,10,150.00,2024-01-15
+BTC-USD,0.1,45000.00,2024-01-20

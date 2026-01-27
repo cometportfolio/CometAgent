@@ -94,6 +94,15 @@ except Exception:
     _PRAW_AVAILABLE = False
     praw = None
 
+# Import confidence scorer
+try:
+    from confidence_scorer import ConfidenceScorer, filter_signals_by_confidence
+    _CONFIDENCE_AVAILABLE = True
+except Exception:
+    _CONFIDENCE_AVAILABLE = False
+    print("Warning: confidence_scorer.py not found. Confidence scoring will be disabled.")
+    ConfidenceScorer = None
+
 
 # ----------------------------- Config -------------------------------- #
 
@@ -1248,7 +1257,38 @@ def analyze_positions(portfolio_type: str, horizon: str, platform: str, position
             news_blended, x_only, reddit_only, sentiment_detail = _score_news_x_and_reddit(pos.symbol, portfolio_type, horizon)
             total = _combine_scores(ta_score, news_blended, x_only, reddit_only, horizon)
             decision = _decide(total, ind)
-            rows.append({
+
+            # Calculate confidence score if available
+            confidence_breakdown = None
+            if _CONFIDENCE_AVAILABLE and ConfidenceScorer:
+                try:
+                    scorer = ConfidenceScorer()
+                    # Convert indicators to dict format
+                    indicators_dict = {
+                        'close': ind.close,
+                        'rsi14': ind.rsi14,
+                        'sma50': ind.sma50,
+                        'sma200': ind.sma200,
+                        'macd': ind.macd,
+                        'macd_signal': ind.macd_signal,
+                        'bb_up': ind.bb_up,
+                        'bb_dn': ind.bb_dn,
+                        'bb_mid': ind.bb_mid,
+                        'atr14': ind.atr14
+                    }
+                    sentiment_dict = {
+                        'sentiment_score': news_blended,
+                        'x_only_score': x_only,
+                        'reddit_only_score': reddit_only
+                    }
+                    confidence_breakdown = scorer.calculate_confidence(
+                        indicators_dict, sentiment_dict, decision.action, pos.symbol, horizon
+                    )
+                except Exception as conf_e:
+                    print(f"Warning: Confidence calculation failed for {pos.symbol}: {conf_e}")
+                    confidence_breakdown = None
+
+            row_data = {
                 "symbol": pos.symbol,
                 "close": ind.close,
                 "rsi14": ind.rsi14,
@@ -1266,14 +1306,54 @@ def analyze_positions(portfolio_type: str, horizon: str, platform: str, position
                 "target_pct_delta": decision.target_pct_delta,
                 "ta_reason": ta_detail,
                 "sentiment_detail": sentiment_detail
-            })
+            }
+
+            # Add confidence data if available
+            if confidence_breakdown:
+                row_data.update({
+                    "confidence": confidence_breakdown.overall,
+                    "conf_technical": confidence_breakdown.technical,
+                    "conf_sentiment": confidence_breakdown.sentiment,
+                    "conf_strength": confidence_breakdown.strength,
+                    "conf_historical": confidence_breakdown.historical
+                })
+            else:
+                row_data.update({
+                    "confidence": float('nan'),
+                    "conf_technical": float('nan'),
+                    "conf_sentiment": float('nan'),
+                    "conf_strength": float('nan'),
+                    "conf_historical": float('nan')
+                })
+
+            rows.append(row_data)
         except Exception as e:
-            rows.append({
+            error_row = {
                 "symbol": pos.symbol,
-                "error": str(e),
+                "close": float('nan'),
+                "rsi14": float('nan'),
+                "sma50": float('nan'),
+                "sma200": float('nan'),
+                "macd": float('nan'),
+                "macd_signal": float('nan'),
+                "atr14": float('nan'),
+                "ta_score": float('nan'),
+                "sentiment_score": float('nan'),
+                "x_only_score": float('nan'),
+                "reddit_only_score": float('nan'),
+                "total_score": float('nan'),
                 "decision": "No Data",
-                "target_pct_delta": 0.0
-            })
+                "target_pct_delta": 0.0,
+                "ta_reason": "Error occurred",
+                "sentiment_detail": "Error occurred",
+                "confidence": float('nan'),
+                "conf_technical": float('nan'),
+                "conf_sentiment": float('nan'),
+                "conf_strength": float('nan'),
+                "conf_historical": float('nan'),
+                "error": str(e)
+            }
+            rows.append(error_row)
     return pd.DataFrame(rows)
 
 def generate_prompts(df_signals: pd.DataFrame, platform: str, horizon: str) -> List[Dict[str,str]]:
@@ -1309,12 +1389,41 @@ def main():
     parser.add_argument("--horizon", required=True, choices=["short","medium","long"])
     parser.add_argument("--platform", required=True, help="e.g., Coinbase, Fidelity, Schwab, E*TRADE, Robinhood, IBKR")
     parser.add_argument("--file", required=True, help="CSV or XLSX portfolio file")
+    parser.add_argument("--min-confidence", type=float, default=0.0,
+                       help="Minimum confidence score (0-100) to include signals (default: 0)")
+    parser.add_argument("--show-confidence-viz", action="store_true",
+                       help="Generate and display confidence score distribution visualization")
     args = parser.parse_args()
 
     positions = _read_portfolio(args.file, args.portfolio_type)
     df_signals = analyze_positions(args.portfolio_type, args.horizon, args.platform, positions)
-    prompts = generate_prompts(df_signals, args.platform, args.horizon)
-    sig_path, pr_path = _write_outputs(df_signals, prompts)
+
+    # Apply confidence filtering if requested
+    if args.min_confidence > 0 and _CONFIDENCE_AVAILABLE and 'confidence' in df_signals.columns:
+        print(f"\nApplying confidence filter (min: {args.min_confidence})")
+        df_signals_filtered = filter_signals_by_confidence(df_signals, args.min_confidence)
+    else:
+        df_signals_filtered = df_signals
+
+    # Generate confidence visualization if requested
+    if args.show_confidence_viz and _CONFIDENCE_AVAILABLE and 'confidence' in df_signals.columns:
+        try:
+            from confidence_scorer import ConfidenceScorer
+            scorer = ConfidenceScorer()
+            confidence_scores = df_signals['confidence'].dropna().tolist()
+            if confidence_scores:
+                viz_path = f"confidence_distribution_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                scorer.visualize_confidence_distribution(confidence_scores,
+                                                       f"{args.portfolio_type.title()} Portfolio",
+                                                       viz_path)
+                print(f"Confidence visualization saved to: {viz_path}")
+            else:
+                print("No confidence scores available for visualization")
+        except Exception as viz_e:
+            print(f"Warning: Confidence visualization failed: {viz_e}")
+
+    prompts = generate_prompts(df_signals_filtered, args.platform, args.horizon)
+    sig_path, pr_path = _write_outputs(df_signals_filtered, prompts)
 
     # Console summary
     print("\n=== COMET TRADING REPORT ===")
@@ -1322,13 +1431,36 @@ def main():
     print(f"Portfolio type: {args.portfolio_type} | Horizon: {args.horizon} | Platform: {args.platform}")
 
     # Select columns that exist in the DataFrame
-    available_cols = ["symbol", "decision", "target_pct_delta"]
-    if "close" in df_signals.columns:
-        available_cols.insert(1, "close")
-    if "total_score" in df_signals.columns:
-        available_cols.insert(-2, "total_score")
+    available_cols = []
+    for col in ["symbol", "decision", "target_pct_delta"]:
+        if col in df_signals_filtered.columns:
+            available_cols.append(col)
 
-    print(df_signals[available_cols].to_string(index=False))
+    # Add optional columns if they exist
+    if "close" in df_signals_filtered.columns:
+        available_cols.insert(-1, "close")
+    if "total_score" in df_signals_filtered.columns:
+        available_cols.insert(-1, "total_score")
+    if "confidence" in df_signals_filtered.columns and _CONFIDENCE_AVAILABLE:
+        available_cols.insert(-1, "confidence")
+
+    # Display confidence summary if available
+    if _CONFIDENCE_AVAILABLE and 'confidence' in df_signals.columns:
+        confidence_scores = df_signals['confidence'].dropna()
+        if len(confidence_scores) > 0:
+            print(f"\n=== CONFIDENCE SUMMARY ===")
+            print(f"Average Confidence: {confidence_scores.mean():.1f}")
+            print(f"Median Confidence: {confidence_scores.median():.1f}")
+            print(f"Confidence Range: {confidence_scores.min():.1f} - {confidence_scores.max():.1f}")
+
+            high_conf = (confidence_scores >= 70).sum()
+            med_conf = ((confidence_scores >= 40) & (confidence_scores < 70)).sum()
+            low_conf = (confidence_scores < 40).sum()
+            print(f"High Confidence (≥70): {high_conf} signals")
+            print(f"Medium Confidence (40-69): {med_conf} signals")
+            print(f"Low Confidence (<40): {low_conf} signals")
+
+    print(df_signals_filtered[available_cols].to_string(index=False))
     print(f"\nSaved signals to: {sig_path}")
     print(f"Saved Comet prompts to: {pr_path}")
     print("\nOptimized for Perplexity Comet browser automation")
